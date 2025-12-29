@@ -130,8 +130,9 @@ Promotion is allowed only when all conditions are met:
 - out/mn_trading/experiments/<exp_id>/<mode>/<run_id>/signals/aggregated_signals.csv for walk-forward signals.
 - out/mn_trading/datasets/cut_<YYYYMMDD>/ for cut-date OHLCV inputs.
 
-## Default Execution Mode
-- Default operation uses a 2-layer gate:
+## Recommended Execution Mode
+- Default CLI execution uses `--gate-mode none`.
+- Recommended operation uses a 2-layer gate:
   1) SRZ Execution Gate
   2) LLM-gate (policy C)
 - The goal is exposure control while maintaining or improving expectancy, not profit maximization.

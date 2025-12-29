@@ -18,6 +18,7 @@ from mn_trading.gates.llm_gate import apply_llm_gate_to_signals
 from mn_trading.gates.rule_gate import apply_rule_gate_to_signals
 from mn_trading.strategy.wave_3x3.adapter import run_wave_3x3_engine
 from mn_trading.strategy.wave_3x3.types import Wave3x3RunRequest
+from mn_trading.zones.zones_resolver import ZonesResolver, build_bounds_map
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,26 @@ def _normalize_for_aggregation(df: pd.DataFrame) -> pd.DataFrame | None:
     return None
 
 
+def _normalize_code(value: str) -> str:
+    text = str(value).strip()
+    return text.zfill(6) if text.isdigit() else text
+
+
+def _build_bounds_map_from_df(
+    resolver: ZonesResolver,
+    df: pd.DataFrame,
+    cut_mode: str = "trade_date",
+) -> dict[tuple[str, str], tuple[float, float]]:
+    if df.empty:
+        return {}
+    date_col = "date" if "date" in df.columns else "asof" if "asof" in df.columns else None
+    if not date_col or "code" not in df.columns:
+        return {}
+    unique_dates = sorted({str(value) for value in df[date_col].dropna().unique()})
+    codes = sorted({_normalize_code(value) for value in df["code"].dropna().unique()})
+    return build_bounds_map(resolver, codes, unique_dates, cut_mode=cut_mode)
+
+
 def count_gate_applied_days(rule_df: pd.DataFrame) -> int:
     if rule_df.empty:
         return 0
@@ -70,7 +91,8 @@ def build_llm_signals_from_rule(
     seed: int,
     llm_model: str | None,
     llm_gate_policy: str,
-    zones_csv_path: str | None,
+    srz_bounds_map: dict[tuple[str, str], tuple[float, float]] | None,
+    srz_missing: str,
     daily_data_dir: str | None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     if rule_df.empty:
@@ -115,7 +137,8 @@ def build_llm_signals_from_rule(
         seed,
         llm_model,
         policy=llm_gate_policy,
-        zones_csv_path=zones_csv_path,
+        srz_bounds_map=srz_bounds_map,
+        srz_missing=srz_missing,
         daily_data_dir=daily_data_dir,
     )
     summary["gate_mode"] = "llm"
@@ -146,6 +169,7 @@ def run_experiments(
     src_data_dir: str,
     gate_mode: str,
     llm_gate_policy: str,
+    srz_missing: str,
     llm_model: str | None,
     reuse_exp_id: str | None,
 ) -> dict[str, Any]:
@@ -161,6 +185,7 @@ def run_experiments(
         "out_root": _as_relative(root_dir),
         "gate_mode": gate_mode,
         "llm_gate_policy": llm_gate_policy,
+        "srz_missing": srz_missing,
     }
     trade_dates: list[str] = []
     if walk_forward_bars > 0:
@@ -184,6 +209,7 @@ def run_experiments(
     root_dir.mkdir(parents=True, exist_ok=True)
     summary_rows: list[dict[str, Any]] = []
     dataset_cache: dict[str, str] = {}
+    zones_resolver = ZonesResolver(src_data_dir=src_data_dir)
 
     if walk_forward_bars > 0 and not trade_dates:
         raise ValueError("walk-forward bars requested but no trade dates available")
@@ -259,6 +285,12 @@ def run_experiments(
         else:
             rule_df_cache = pd.DataFrame()
         gate_applied_days = count_gate_applied_days(rule_df_cache)
+        srz_bounds_map: dict[tuple[str, str], tuple[float, float]] = {}
+        if gate_mode == "llm" and "llm" in modes:
+            normalized_codes = [_normalize_code(code) for code in codes]
+            srz_bounds_map = build_bounds_map(
+                zones_resolver, normalized_codes, trade_dates, cut_mode="trade_date"
+            )
 
         for mode_name in modes:
             mode_dir = root_dir / mode_name
@@ -300,7 +332,8 @@ def run_experiments(
                         seed=seed,
                         llm_model=llm_model,
                         llm_gate_policy=llm_gate_policy,
-                        zones_csv_path=zones_csv,
+                        srz_bounds_map=srz_bounds_map,
+                        srz_missing=srz_missing,
                         daily_data_dir=str(data_dir_path),
                     )
                     run_meta["gate_summary"] = gate_summary
@@ -336,6 +369,10 @@ def run_experiments(
                 srz_rows_total = int(gate_summary.get("srz_rows_total", 0))
                 srz_rows_block = int(gate_summary.get("srz_rows_block", 0))
                 srz_rows_allow = int(gate_summary.get("srz_rows_allow", 0))
+                srz_rows_missing = int(gate_summary.get("srz_rows_missing", 0))
+                srz_rows_price_missing = int(gate_summary.get("srz_rows_price_missing", 0))
+                srz_rows_missing = int(gate_summary.get("srz_rows_missing", 0))
+                srz_rows_price_missing = int(gate_summary.get("srz_rows_price_missing", 0))
                 noop_reasons = gate_summary.get("noop_reasons", {}) or {}
                 reason_keys = ["schema_error", "parse_error", "empty_response", "timeout", "exception"]
                 reasons_summary = ",".join(
@@ -364,6 +401,8 @@ def run_experiments(
                     f"srz_rows_total:{srz_rows_total}",
                     f"srz_rows_block:{srz_rows_block}",
                     f"srz_rows_allow:{srz_rows_allow}",
+                    f"srz_rows_missing:{srz_rows_missing}",
+                    f"srz_rows_price_missing:{srz_rows_price_missing}",
                 ]
                 if llm_noop_total and reasons_summary:
                     suffix_parts.append(f"llm_noop_reason:{reasons_summary}")
@@ -469,13 +508,15 @@ def run_experiments(
                         df = pd.read_csv(signals_path)
                     else:
                         df = pd.DataFrame()
+                    srz_bounds_map = _build_bounds_map_from_df(zones_resolver, df, cut_mode="trade_date")
                     gated_df, gate_summary = build_llm_signals_from_rule(
                         df,
                         gate_mode=gate_mode,
                         seed=seed,
                         llm_model=llm_model,
                         llm_gate_policy=llm_gate_policy,
-                        zones_csv_path=zones_csv,
+                        srz_bounds_map=srz_bounds_map,
+                        srz_missing=srz_missing,
                         daily_data_dir=str(data_dir_path),
                     )
                     run_meta["gate_summary"] = gate_summary
@@ -540,13 +581,15 @@ def run_experiments(
                         df = pd.read_csv(signals_path)
                     else:
                         df = pd.DataFrame()
+                    srz_bounds_map = _build_bounds_map_from_df(zones_resolver, df, cut_mode="trade_date")
                     gated_df, gate_summary = build_llm_signals_from_rule(
                         df,
                         gate_mode=gate_mode,
                         seed=seed,
                         llm_model=llm_model,
                         llm_gate_policy=llm_gate_policy,
-                        zones_csv_path=zones_csv,
+                        srz_bounds_map=srz_bounds_map,
+                        srz_missing=srz_missing,
                         daily_data_dir=str(data_dir_path),
                     )
                     run_meta["gate_summary"] = gate_summary
@@ -614,6 +657,8 @@ def run_experiments(
                     f"srz_rows_total:{srz_rows_total}",
                     f"srz_rows_block:{srz_rows_block}",
                     f"srz_rows_allow:{srz_rows_allow}",
+                    f"srz_rows_missing:{srz_rows_missing}",
+                    f"srz_rows_price_missing:{srz_rows_price_missing}",
                 ]
                 if llm_noop_total and reasons_summary:
                     suffix_parts.append(f"llm_noop_reason:{reasons_summary}")

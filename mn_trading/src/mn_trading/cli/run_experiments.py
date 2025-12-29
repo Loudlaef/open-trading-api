@@ -29,6 +29,12 @@ def parse_args() -> argparse.Namespace:
         default="C",
         help="llm gate policy (used only when --gate-mode=llm)",
     )
+    parser.add_argument(
+        "--srz-missing",
+        choices=["warn", "block", "fail"],
+        default="warn",
+        help="SRZ missing-data handling",
+    )
     parser.add_argument("--llm-model", default=None)
     parser.add_argument("--reuse-exp-id", default=None)
     parser.add_argument("--dry-run", action="store_true", help="print plan only")
@@ -55,6 +61,7 @@ def main() -> int:
         src_data_dir=args.src_data_dir,
         gate_mode=args.gate_mode,
         llm_gate_policy=args.llm_gate_policy,
+        srz_missing=args.srz_missing,
         llm_model=args.llm_model,
         reuse_exp_id=args.reuse_exp_id,
     )

@@ -19,6 +19,9 @@
 - Added: SRZ execution gate layered above policy C to block BUY_* outside long-term zones
 - Added: Default execution mode fixed to policy C with SRZ execution gate
 - Changed: strong/A/B policies marked as experimental only
+- Fixed: Walk-forward SRZ now resolves per trade_date to remove lookahead bias
+- Changed: SRZ missing-data handling supports warn/block/fail with counters
+- Changed: Documented default CLI mode as gate-mode none and SRZ+policy C as recommended
 - Risk/Impact: Metrics evaluation only
 - Migration: None
 

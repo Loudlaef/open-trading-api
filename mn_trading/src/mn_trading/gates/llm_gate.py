@@ -20,26 +20,16 @@ def _normalize_code(value: Any) -> str:
     return text.zfill(6) if text.isdigit() else text
 
 
-def _load_srz_bounds(zones_csv_path: str | None) -> dict[str, tuple[float, float]]:
-    if not zones_csv_path:
-        return {}
-    path = Path(zones_csv_path)
-    if not path.exists():
-        return {}
-    df = pd.read_csv(path, dtype={"code": str})
-    if "code" not in df.columns or "C_low" not in df.columns or "C_high" not in df.columns:
-        return {}
-    srz_map: dict[str, tuple[float, float]] = {}
-    for _, row in df.iterrows():
-        code = _normalize_code(row.get("code", ""))
+def _get_price(row: pd.Series, prefer: tuple[str, ...] = ("price", "close", "adj_close")) -> float | None:
+    for name in prefer:
+        value = row.get(name)
+        if value is None or pd.isna(value):
+            continue
         try:
-            low = float(row.get("C_low"))
-            high = float(row.get("C_high"))
+            return float(value)
         except (TypeError, ValueError):
             continue
-        if not (pd.isna(low) or pd.isna(high)):
-            srz_map[code] = (low, high)
-    return srz_map
+    return None
 
 
 def _init_noop_counts() -> dict[str, int]:
@@ -177,7 +167,8 @@ def apply_llm_gate_to_signals(
     seed: int,
     model: str | None,
     policy: str = "C",
-    zones_csv_path: str | None = None,
+    srz_bounds_map: dict[tuple[str, str], tuple[float, float]] | None = None,
+    srz_missing: str = "warn",
     daily_data_dir: str | None = None,
     daily_df: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
@@ -211,6 +202,9 @@ def apply_llm_gate_to_signals(
             "model": model or "",
         }
 
+    if srz_missing not in {"warn", "block", "fail"}:
+        srz_missing = "warn"
+
     out = _normalize_rule_dates(df)
     decisions: list[dict[str, Any]] = []
     noop_counts = _init_noop_counts()
@@ -243,45 +237,64 @@ def apply_llm_gate_to_signals(
     srz_rows_total = buy_rows_total
     srz_rows_block = 0
     srz_rows_allow = 0
-    srz_map = _load_srz_bounds(zones_csv_path)
+    srz_rows_missing = 0
+    srz_rows_price_missing = 0
+    bounds_map = srz_bounds_map or {}
 
     for idx, row in out.iterrows():
         action = str(row.get("action", ""))
         if not action.startswith("BUY"):
             continue
         code = _normalize_code(row.get("code", ""))
-        price_raw = row.get("price", row.get("close"))
-        try:
-            price = float(price_raw)
-        except (TypeError, ValueError):
-            price = float("nan")
-        in_srz = True
-        if srz_map:
-            bounds = srz_map.get(code)
-            if bounds and not pd.isna(price):
-                low, high = bounds
-                in_srz = low <= price <= high
-            elif bounds and pd.isna(price):
-                in_srz = False
-            else:
-                in_srz = True
-        if not in_srz:
-            srz_rows_block += 1
-            out.at[idx, "action"] = "HOLD"
-            decisions.append(
-                {
-                    "date": _date_key(row.get("__date_key__")),
-                    "code": code,
-                    "action": action,
-                    "decision": "BLOCK",
-                    "bb50_position": row.get("bb50_position"),
-                    "wave_state": row.get("wave_state"),
-                    "entry_stage": row.get("entry_stage", 0),
-                    "missing_indicator": False,
-                    "srz_block": True,
-                }
-            )
-            continue
+        date_key = _date_key(row.get("__date_key__"))
+        price = _get_price(row)
+        bounds = bounds_map.get((code, date_key))
+        bounds_missing = bounds is None
+        price_missing = price is None
+        if bounds_missing:
+            srz_rows_missing += 1
+        if price_missing:
+            srz_rows_price_missing += 1
+        if bounds_missing or price_missing:
+            if srz_missing == "fail":
+                raise ValueError("srz bounds missing for row")
+            if srz_missing == "block":
+                srz_rows_block += 1
+                out.at[idx, "action"] = "HOLD"
+                decisions.append(
+                    {
+                        "date": date_key,
+                        "code": code,
+                        "action": action,
+                        "decision": "BLOCK",
+                        "bb50_position": row.get("bb50_position"),
+                        "wave_state": row.get("wave_state"),
+                        "entry_stage": row.get("entry_stage", 0),
+                        "missing_indicator": False,
+                        "srz_block": True,
+                    }
+                )
+                continue
+        else:
+            low, high = bounds
+            if not (low <= price <= high):
+                srz_rows_block += 1
+                out.at[idx, "action"] = "HOLD"
+                decisions.append(
+                    {
+                        "date": date_key,
+                        "code": code,
+                        "action": action,
+                        "decision": "BLOCK",
+                        "bb50_position": row.get("bb50_position"),
+                        "wave_state": row.get("wave_state"),
+                        "entry_stage": row.get("entry_stage", 0),
+                        "missing_indicator": False,
+                        "srz_block": True,
+                    }
+                )
+                continue
+
         bb50_position = row.get("bb50_position")
         bb20_cross = row.get("bb20_cross")
         wave_state = row.get("wave_state")
@@ -291,7 +304,7 @@ def apply_llm_gate_to_signals(
             out.at[idx, "action"] = "HOLD"
             decisions.append(
                 {
-                    "date": _date_key(row.get("__date_key__")),
+                    "date": date_key,
                     "code": code,
                     "action": action,
                     "decision": "BLOCK",
@@ -322,8 +335,8 @@ def apply_llm_gate_to_signals(
         if bb50_position == "BELOW":
             buy_rows_bb50_below += 1
         payload = {
-            "code": _normalize_code(row.get("code", "")),
-            "date": _date_key(row.get("__date_key__")),
+            "code": code,
+            "date": date_key,
             "action": action,
             "wave_state": wave_state,
             "bb20_cross": bb20_cross,
@@ -354,8 +367,8 @@ def apply_llm_gate_to_signals(
             llm_decision_allow += 1
         decisions.append(
             {
-                "date": _date_key(row.get("__date_key__")),
-                "code": _normalize_code(row.get("code", "")),
+                "date": date_key,
+                "code": code,
                 "action": action,
                 "decision": local_decision,
                 "bb50_position": bb50_position,
@@ -385,6 +398,8 @@ def apply_llm_gate_to_signals(
         "srz_rows_total": srz_rows_total,
         "srz_rows_block": srz_rows_block,
         "srz_rows_allow": srz_rows_allow,
+        "srz_rows_missing": srz_rows_missing,
+        "srz_rows_price_missing": srz_rows_price_missing,
         "model": model or "",
     }
     return out, summary
